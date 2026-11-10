@@ -806,6 +806,28 @@ class User extends Common_functions {
      * @return void
      */
     public function authenticate ($username, $password, $saml = false) {
+        # unknown user: try all Radius methods, the user is created on success
+        if ($saml === false && is_string($username) && !is_blank($username) && !is_object($this->user)) {
+            try {
+                $existing = $this->Database->findObject("users", "username", $username);
+                $methods  = $existing ? false : $this->Database->findObjects("usersAuthMethod", "type", "Radius");
+            } catch (Exception $e) {
+                $this->Result->show("danger", _("Error: ") . $e->getMessage(), true);
+            }
+            if (is_array($methods) && sizeof($methods) > 0) {
+                foreach ($methods as $method) {
+                    $client = $this->radius_request (db_json_decode($method->params), $username, $password);
+                    if ($client !== false) {
+                        $this->authmethodid     = $method->id;
+                        $this->authmethodtype   = "auth_Radius";
+                        $this->authmethodparams = $method->params;
+                        $this->auth_radius ($username, $password, $client);
+                        return;
+                    }
+                }
+                $this->radius_failed ($username, _("Failed to authenticate user on radius server"));
+            }
+        }
         # first we need to check if username exists
         $this->fetch_user_details ($username);
         # set method type if set, otherwise presume local auth
@@ -1219,22 +1241,58 @@ class User extends Common_functions {
      *
      * GH: https://github.com/dapphp/radius
      *
+     * Groups and role are taken from Class (25) reply attributes, one group
+     * name per attribute. "Administrators" grants the Administrator role.
+     *
      * @access private
      * @param mixed $username
      * @param mixed $password
+     * @param Radius|null $client  already accepted request (unknown user login)
      * @return void
      */
-    private function auth_radius ($username, $password) {
-        # decode radius parameters
-        $params = db_json_decode($this->authmethodparams);
+    private function auth_radius ($username, $password, $client = null) {
+        # send request unless already done
+        if ($client === null) {
+            $client = $this->radius_request (db_json_decode($this->authmethodparams), $username, $password);
+        }
+        if ($client === false) {
+            $this->radius_failed ($username, _("Failed to authenticate user on radius server"));
+        }
 
+        # create / update user from reply attributes
+        $this->radius_sync_user ($username, $client);
+
+        # check login restrictions for authenticated user
+        $this->check_login_restrictions ($username);
+        # save to session
+        $this->write_session_parameters ();
+
+        $this->Log->write( _("Radius login"), _("User")." ".$this->user->real_name." "._("logged in via radius"), 0, $username );
+        $this->Result->show("success", _("Radius login successful"));
+
+        # write last logintime
+        $this->update_login_time ();
+        # remove possible blocked IP
+        $this->block_remove_entry ();
+    }
+
+    /**
+     * Sends Access-Request to radius server
+     *
+     * @access private
+     * @param object $params
+     * @param mixed $username
+     * @param mixed $password
+     * @return Radius|false  client holding the Access-Accept, or false
+     */
+    private function radius_request ($params, $username, $password) {
         # Valdate composer
         if($this->composer_has_errors(["dapphp/radius"])) {
             $this->Result->show("danger", _("Error in authentication method. Please contact administrator").".", true);
         }
 
         # Composer
-        require __DIR__ . '/../vendor/autoload.php';
+        require_once __DIR__ . '/../vendor/autoload.php';
 
         // init client
         $client = new Radius();
@@ -1245,7 +1303,9 @@ class User extends Common_functions {
                ->setAuthenticationPort($params->port)
                ->setTimeout($params->timeout)
                ->setNasIpAddress(gethostbyname(gethostname()))
-               ->setAttribute(32, 'login');
+               ->setAttribute(32, 'login')
+               // BlastRADIUS (CVE-2024-3596): FreeRADIUS >= 3.2.5 drops requests without it
+               ->setIncludeMessageAuthenticator();
 
 
         // debug?
@@ -1275,34 +1335,81 @@ class User extends Common_functions {
             $this->Result->show("danger", _("Invalid radius authentication method"), true);
         }
 
-        # authenticate user
-        if($authenticated === true) {
-            # check login restrictions for authenticated user
-            $this->check_login_restrictions ($username);
-            # save to session
-            $this->write_session_parameters ();
-
-            $this->Log->write( _("Radius login"), _("User")." ".$this->user->real_name." "._("logged in via radius"), 0, $username );
-            $this->Result->show("success", _("Radius login successful"));
-
-            # write last logintime
-            $this->update_login_time ();
-            # remove possible blocked IP
-            $this->block_remove_entry ();
+        if ($authenticated !== true && $this->debugging) {
+            $this->Result->show("danger", $client->getErrorMessage()." (".$client->getErrorCode().")", false);
         }
-        else {
-            # add blocked count
-            $this->block_ip ();
-            $this->log_failed_access ($username);
-            $this->Log->write( _("Radius login"), _("Failed to authenticate user on radius server"), 2, $username );
-            $this->Result->show("danger", _("Invalid username or password"), true);
-            # debug ?
-            if($this->debugging) {
-                print "<pre style='width:700px;margin:auto;margin-top:10px;'>";
-                print "Access-Request failed with error ".$client->getErrorMessage()." (".$client->getErrorCode().")";
-                print "</pre>";
+
+        return $authenticated === true ? $client : false;
+    }
+
+    /**
+     * Creates the user, or syncs its groups and role, from Class (25) attributes
+     *
+     * - unknown user: created; needs a known group or "Administrators"
+     * - existing user with no Class attribute in the reply: left unchanged
+     *
+     * @access private
+     * @param mixed $username
+     * @param Radius $client
+     * @return void
+     */
+    private function radius_sync_user ($username, $client) {
+        # group names from reply
+        $names = [];
+        foreach ((array) $client->getReceivedAttributes() as $attr) {
+            if ((int) $attr[0] === 25) { $names[] = trim((string) $attr[1]); }
+        }
+
+        try {
+            $user = $this->Database->findObject("users", "username", $username);
+            if (is_object($user) && sizeof($names) == 0) {
+                $this->fetch_user_details ($username, true);
+                return;
             }
+
+            # map names to group ids
+            $groups = [];
+            foreach ((array) $this->Database->getObjects("userGroups", "g_id") as $g) {
+                if (in_array($g->g_name, $names, true)) { $groups[$g->g_id] = $g->g_id; }
+            }
+            $role = in_array("Administrators", $names, true) ? "Administrator" : "User";
+
+            if (sizeof($groups) == 0 && $role != "Administrator") {
+                $this->radius_failed ($username, _("Radius reply has no known group").": ".implode(",", $names));
+            }
+
+            $values = ["role" => $role, "groups" => sizeof($groups) ? json_encode($groups) : null];
+            if (!is_object($user)) {
+                $values += ["username" => $username, "real_name" => $username, "authMethod" => $this->authmethodid];
+                $this->Database->insertObject("users", $values);
+                $this->Log->write( _("Radius login"), _("User created by radius").", role ".$role.", groups ".implode(",", $names), 1, $username );
+            }
+            elseif ($user->role != $role || db_json_decode($user->groups, true) != $groups) {
+                $this->Database->updateObject("users", $values + ["id" => $user->id]);
+                $this->Log->write( _("Radius login"), _("User updated by radius").", role ".$role.", groups ".implode(",", $names), 1, $username );
+            }
+        } catch (Exception $e) {
+            $this->Result->show("danger", _("Error: ") . $e->getMessage(), true);
         }
+
+        # reload
+        $this->isadmin = false;
+        $this->fetch_user_details ($username, true);
+    }
+
+    /**
+     * Failed radius login (does not return)
+     *
+     * @access private
+     * @param mixed $username
+     * @param string $reason
+     * @return void
+     */
+    private function radius_failed ($username, $reason) {
+        $this->block_ip ();
+        $this->log_failed_access ($username);
+        $this->Log->write( _("Radius login"), $reason, 2, $username );
+        $this->Result->show("danger", _("Invalid username or password"), true);
     }
 
     /**
